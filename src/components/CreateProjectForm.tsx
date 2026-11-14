@@ -40,6 +40,7 @@ export function CreateProjectForm() {
           value={name}
           onChange={(e) => setName(e.target.value)}
           required
+          maxLength={100}
           placeholder="Dam A"
         />
       </label>
@@ -49,6 +50,7 @@ export function CreateProjectForm() {
           value={site}
           onChange={(e) => setSite(e.target.value)}
           required
+          maxLength={200}
           placeholder="Upper gorge, River X"
         />
       </label>

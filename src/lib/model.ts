@@ -6,6 +6,20 @@ export const STUDY_SCOPES = [
   "feed",
 ] as const;
 
+/** Caps on stored text and create actions (security / resource limits). */
+export const LIMITS = {
+  name: 100,
+  site: 200,
+  path: 500,
+  note: 2000,
+  firmEmail: 254,
+  firmSub: 200,
+  seatsPerProject: 50,
+  deliveriesPerProject: 200,
+  invitesPerSeat: 20,
+  projectsPerOperator: 50,
+} as const;
+
 export type StudyScope = (typeof STUDY_SCOPES)[number];
 export type SeatRole = "study";
 export type SeatStatus = "open" | "claimed" | "delivered";
@@ -15,6 +29,7 @@ export interface Profile {
   sub: string;
   name: string;
   type: ProfileType;
+  email: string | null;
   created_at: string;
 }
 
@@ -31,7 +46,12 @@ export interface Project {
 export interface SeatInvite {
   id: string;
   seat_id: string;
+  /** Display-only label; never used for authorization. */
   firm_name: string;
+  /** Cursor identity.sub of the invited firm (preferred auth bind). */
+  firm_sub: string | null;
+  /** Cursor identity email of the invited firm (auth bind). */
+  firm_email: string | null;
   invited_by_sub: string;
   invited_by_name: string;
   invited_at: string;

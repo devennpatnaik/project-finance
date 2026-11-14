@@ -33,7 +33,12 @@ export function ProfileSwitch({ profile }: { profile: Profile }) {
     <form className="panel form-grid" onSubmit={save}>
       <label>
         Acting as
-        <input value={name} onChange={(e) => setName(e.target.value)} required />
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          required
+          maxLength={100}
+        />
       </label>
       <label>
         Role

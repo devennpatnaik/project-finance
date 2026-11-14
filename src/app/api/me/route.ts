@@ -1,6 +1,6 @@
 import { requireViewer } from "@/lib/auth";
 import { jsonError, jsonOk, NO_STORE } from "@/lib/http";
-import { getProfile, upsertProfile } from "@/lib/study";
+import { getProfile, syncProfileEmail, upsertProfile } from "@/lib/study";
 import type { ProfileType } from "@/lib/model";
 
 export const dynamic = "force-dynamic";
@@ -11,10 +11,12 @@ export async function GET(request: Request) {
     identity.headers.set("Cache-Control", "private, no-store");
     return identity;
   }
+  await syncProfileEmail(identity.sub, identity.email);
   const profile = await getProfile(identity.sub);
   return jsonOk({
     name: identity.name,
     email: identity.email,
+    sub: identity.sub,
     simulated: identity.simulated,
     profile,
   });
@@ -37,6 +39,7 @@ export async function POST(request: Request) {
       identity.sub,
       (body.name?.trim() || identity.name || "Viewer").trim(),
       body.type === "firm" ? "firm" : "operator",
+      identity.email,
     );
     return jsonOk({ profile });
   } catch (error) {

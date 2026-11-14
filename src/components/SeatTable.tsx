@@ -135,7 +135,13 @@ export function SeatTable({
                     ) : null}
                     {seat.invites && seat.invites.length > 0 ? (
                       <div className="meta" style={{ color: "var(--ink-muted)", fontSize: "0.8rem" }}>
-                        invited: {seat.invites.map((i) => i.firm_name).join(", ")}
+                        invited:{" "}
+                        {seat.invites
+                          .map(
+                            (i) =>
+                              i.firm_email || i.firm_sub || i.firm_name,
+                          )
+                          .join(", ")}
                       </div>
                     ) : null}
                   </td>
@@ -144,7 +150,8 @@ export function SeatTable({
                     {isOwner && profile?.type === "operator" && seat.status !== "delivered" ? (
                       <div className="inline-actions">
                         <input
-                          placeholder="Firm name"
+                          placeholder="Firm email"
+                          type="email"
                           value={inviteBySeat[seat.id] ?? ""}
                           onChange={(e) =>
                             setInviteBySeat((m) => ({
@@ -164,7 +171,7 @@ export function SeatTable({
                                 method: "POST",
                                 headers: { "content-type": "application/json" },
                                 body: JSON.stringify({
-                                  firm: inviteBySeat[seat.id] ?? "",
+                                  email: inviteBySeat[seat.id] ?? "",
                                 }),
                               }),
                             );

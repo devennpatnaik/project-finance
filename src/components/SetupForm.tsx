@@ -40,6 +40,7 @@ export function SetupForm({
           value={name}
           onChange={(e) => setName(e.target.value)}
           required
+          maxLength={100}
           placeholder="River Ops"
         />
       </label>

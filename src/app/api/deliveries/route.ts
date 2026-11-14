@@ -14,7 +14,6 @@ export async function POST(request: Request) {
     seatId?: string;
     path?: string;
     note?: string;
-    credit?: string;
   };
   try {
     body = (await request.json()) as typeof body;
@@ -25,7 +24,6 @@ export async function POST(request: Request) {
     const delivery = await addDelivery(auth.profile, body.seatId ?? "", {
       path: body.path,
       note: body.note,
-      credit: body.credit,
     });
     return jsonOk({ delivery }, 201);
   } catch (error) {

@@ -1,5 +1,6 @@
 import { sql } from "./db";
 import {
+  LIMITS,
   formatBudget,
   isStudyScope,
   shortId,
@@ -12,9 +13,42 @@ import {
   type StudyScope,
 } from "./model";
 
+function clampText(label: string, value: string, max: number): string {
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error(`${label} is required`);
+  if (trimmed.length > max) {
+    throw new Error(`${label} must be at most ${max} characters`);
+  }
+  return trimmed;
+}
+
+function optionalText(
+  label: string,
+  value: string | undefined | null,
+  max: number,
+): string | null {
+  if (value == null) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (trimmed.length > max) {
+    throw new Error(`${label} must be at most ${max} characters`);
+  }
+  return trimmed;
+}
+
+const PROFILE_SELECT =
+  "sub, name, type, email, created_at::text";
+const INVITE_SELECT =
+  "id, seat_id, firm_name, firm_sub, firm_email, invited_by_sub, invited_by_name, invited_at::text";
+const SEAT_SELECT = `id, project_id, role, scope, status,
+            budget_min::float8 as budget_min,
+            budget_max::float8 as budget_max,
+            claimed_by_sub, claimed_by_name,
+            claimed_at::text, created_at::text`;
+
 export async function getProfile(sub: string): Promise<Profile | null> {
   const rows = await sql<Profile>(
-    "select sub, name, type, created_at::text from profiles where sub = $1",
+    `select ${PROFILE_SELECT} from profiles where sub = $1`,
     [sub],
   );
   return rows[0] ?? null;
@@ -24,24 +58,44 @@ export async function upsertProfile(
   sub: string,
   name: string,
   type: ProfileType,
+  email?: string | null,
 ): Promise<Profile> {
-  const trimmed = name.trim();
-  if (!trimmed) throw new Error("Name is required");
+  const trimmed = clampText("Name", name, LIMITS.name);
   if (type !== "operator" && type !== "firm") {
     throw new Error("Type must be operator or firm");
   }
+  const normalizedEmail =
+    email?.trim() && email.trim().length > 0
+      ? clampText("Email", email, LIMITS.firmEmail).toLowerCase()
+      : null;
   const rows = await sql<Profile>(
-    `insert into profiles (sub, name, type)
-     values ($1, $2, $3)
-     on conflict (sub) do update set name = excluded.name, type = excluded.type
-     returning sub, name, type, created_at::text`,
-    [sub, trimmed, type],
+    `insert into profiles (sub, name, type, email)
+     values ($1, $2, $3, $4)
+     on conflict (sub) do update set
+       name = excluded.name,
+       type = excluded.type,
+       email = coalesce(excluded.email, profiles.email)
+     returning ${PROFILE_SELECT}`,
+    [sub, trimmed, type, normalizedEmail],
   );
   const profile = rows[0]!;
   if (type === "operator") {
     await ensureSampleProject(profile);
   }
   return profile;
+}
+
+/** Keep profile.email in sync with verified Cursor identity email. */
+export async function syncProfileEmail(
+  sub: string,
+  email: string | null | undefined,
+): Promise<void> {
+  if (!email?.trim()) return;
+  const normalized = clampText("Email", email, LIMITS.firmEmail).toLowerCase();
+  await sql(`update profiles set email = $2 where sub = $1`, [
+    sub,
+    normalized,
+  ]);
 }
 
 async function ensureSampleProject(profile: Profile): Promise<void> {
@@ -83,6 +137,13 @@ async function ensureSampleProject(profile: Profile): Promise<void> {
   }
 }
 
+/** Invite match: firm_sub = viewer.sub OR lower(firm_email) = lower(viewer email). */
+function inviteMatchSql(viewerSubParam: string, emailExpr: string): string {
+  return `(i.firm_sub = ${viewerSubParam}
+          or (i.firm_email is not null and ${emailExpr} is not null
+              and lower(i.firm_email) = lower(${emailExpr})))`;
+}
+
 export async function listProjectsForViewer(sub: string): Promise<Project[]> {
   return sql<Project>(
     `select id, name, site, owner_sub, owner_name, is_sample, created_at::text
@@ -95,7 +156,8 @@ export async function listProjectsForViewer(sub: string): Promise<Project[]> {
           select s.project_id
           from seats s
           join seat_invites i on i.seat_id = s.id
-          where lower(i.firm_name) = lower((select name from profiles where sub = $1))
+          left join profiles p on p.sub = $1
+          where ${inviteMatchSql("$1", "p.email")}
         )
      order by created_at asc`,
     [sub],
@@ -110,10 +172,17 @@ export async function createProject(
   if (profile.type !== "operator") {
     throw new Error("Only an operator can create projects");
   }
-  const trimmedName = name.trim();
-  const trimmedSite = site.trim();
-  if (!trimmedName || !trimmedSite) {
-    throw new Error("Name and site are required");
+  const trimmedName = clampText("Name", name, LIMITS.name);
+  const trimmedSite = clampText("Site", site, LIMITS.site);
+  const count = await sql<{ n: string }>(
+    `select count(*)::text as n from projects
+     where owner_sub = $1 and is_sample = false`,
+    [profile.sub],
+  );
+  if (Number(count[0]?.n ?? 0) >= LIMITS.projectsPerOperator) {
+    throw new Error(
+      `At most ${LIMITS.projectsPerOperator} projects per operator`,
+    );
   }
   const id = shortId("prj");
   const rows = await sql<Project>(
@@ -154,32 +223,32 @@ async function canViewProject(
     `select i.id
      from seat_invites i
      join seats s on s.id = i.seat_id
-     join profiles p on p.sub = $2
-     where s.project_id = $1 and lower(i.firm_name) = lower(p.name)
+     left join profiles p on p.sub = $2
+     where s.project_id = $1 and ${inviteMatchSql("$2", "p.email")}
      limit 1`,
     [project.id, viewerSub],
   );
   return invited.length > 0;
 }
 
+async function loadInvites(seatId: string): Promise<SeatInvite[]> {
+  return sql<SeatInvite>(
+    `select ${INVITE_SELECT}
+     from seat_invites where seat_id = $1 order by invited_at asc`,
+    [seatId],
+  );
+}
+
 export async function listSeats(projectId: string): Promise<Seat[]> {
   const seats = await sql<Seat>(
-    `select id, project_id, role, scope, status,
-            budget_min::float8 as budget_min,
-            budget_max::float8 as budget_max,
-            claimed_by_sub, claimed_by_name,
-            claimed_at::text, created_at::text
+    `select ${SEAT_SELECT}
      from seats
      where project_id = $1
      order by created_at asc`,
     [projectId],
   );
   for (const seat of seats) {
-    seat.invites = await sql<SeatInvite>(
-      `select id, seat_id, firm_name, invited_by_sub, invited_by_name, invited_at::text
-       from seat_invites where seat_id = $1 order by invited_at asc`,
-      [seat.id],
-    );
+    seat.invites = await loadInvites(seat.id);
   }
   return seats;
 }
@@ -217,15 +286,18 @@ export async function openSeat(
   ) {
     throw new Error("budget-min cannot exceed budget-max");
   }
+  const count = await sql<{ n: string }>(
+    `select count(*)::text as n from seats where project_id = $1`,
+    [project.id],
+  );
+  if (Number(count[0]?.n ?? 0) >= LIMITS.seatsPerProject) {
+    throw new Error(`At most ${LIMITS.seatsPerProject} seats per project`);
+  }
   const id = shortId("seat");
   const rows = await sql<Seat>(
     `insert into seats (id, project_id, role, scope, status, budget_min, budget_max)
      values ($1, $2, 'study', $3, 'open', $4, $5)
-     returning id, project_id, role, scope, status,
-               budget_min::float8 as budget_min,
-               budget_max::float8 as budget_max,
-               claimed_by_sub, claimed_by_name,
-               claimed_at::text, created_at::text`,
+     returning ${SEAT_SELECT}`,
     [id, project.id, scope, budgetMin ?? null, budgetMax ?? null],
   );
   const seat = rows[0]!;
@@ -233,27 +305,123 @@ export async function openSeat(
   return seat;
 }
 
+export type InviteTarget = {
+  /** Cursor identity.sub of the firm. */
+  firmSub?: string;
+  /** Cursor identity email of the firm. */
+  firmEmail?: string;
+  /** Optional display label only (not used for authorization). */
+  label?: string;
+};
+
 export async function inviteToSeat(
   profile: Profile,
   seatId: string,
-  firmName: string,
+  target: InviteTarget,
 ): Promise<Seat> {
   if (profile.type !== "operator") {
     throw new Error("Only an operator can invite firms to a seat");
   }
-  const firm = firmName.trim();
-  if (!firm) throw new Error("Firm name is required");
+  const firmSub = optionalText("Firm identity", target.firmSub, LIMITS.firmSub);
+  const firmEmailRaw = optionalText(
+    "Firm email",
+    target.firmEmail,
+    LIMITS.firmEmail,
+  );
+  const firmEmail = firmEmailRaw ? firmEmailRaw.toLowerCase() : null;
+  if (!firmSub && !firmEmail) {
+    throw new Error("Invite by firm email or Cursor identity id");
+  }
+  if (firmEmail && !firmEmail.includes("@")) {
+    throw new Error("Firm email must be a valid email address");
+  }
+
+  let display =
+    optionalText("Label", target.label, LIMITS.name) ||
+    firmEmail ||
+    firmSub ||
+    "invited firm";
+
+  if (firmSub) {
+    const known = await getProfile(firmSub);
+    if (known) {
+      display = known.name;
+      if (known.type !== "firm") {
+        throw new Error("Invite target must be a firm profile");
+      }
+    }
+  } else if (firmEmail) {
+    const known = await sql<Profile>(
+      `select ${PROFILE_SELECT} from profiles where lower(email) = lower($1) limit 1`,
+      [firmEmail],
+    );
+    if (known[0] && known[0].type !== "firm") {
+      throw new Error("Invite target must be a firm profile");
+    }
+    if (known[0]) display = known[0].name;
+  }
+
   const seat = await getSeat(seatId);
   await getOwnedProject(seat.project_id, profile.sub);
   if (seat.status === "delivered") {
     throw new Error(`Seat ${seatId} is already delivered`);
   }
+
+  const inviteCount = await sql<{ n: string }>(
+    `select count(*)::text as n from seat_invites where seat_id = $1`,
+    [seatId],
+  );
+  if (Number(inviteCount[0]?.n ?? 0) >= LIMITS.invitesPerSeat) {
+    throw new Error(`At most ${LIMITS.invitesPerSeat} invites per seat`);
+  }
+
+  const dup = await sql<{ id: string }>(
+    `select id from seat_invites
+     where seat_id = $1
+       and (
+         ($2::text is not null and firm_sub = $2)
+         or ($3::text is not null and firm_email is not null and lower(firm_email) = lower($3))
+       )
+     limit 1`,
+    [seatId, firmSub, firmEmail],
+  );
+  if (dup.length) {
+    throw new Error("That firm is already invited to this seat");
+  }
+
   await sql(
-    `insert into seat_invites (id, seat_id, firm_name, invited_by_sub, invited_by_name)
-     values ($1, $2, $3, $4, $5)`,
-    [shortId("inv"), seatId, firm, profile.sub, profile.name],
+    `insert into seat_invites
+       (id, seat_id, firm_name, firm_sub, firm_email, invited_by_sub, invited_by_name)
+     values ($1, $2, $3, $4, $5, $6, $7)`,
+    [
+      shortId("inv"),
+      seatId,
+      display,
+      firmSub,
+      firmEmail,
+      profile.sub,
+      profile.name,
+    ],
   );
   return (await getSeat(seatId))!;
+}
+
+async function hasInviteForFirm(
+  seatId: string,
+  profile: Profile,
+): Promise<boolean> {
+  const rows = await sql<{ id: string }>(
+    `select id from seat_invites
+     where seat_id = $1
+       and (
+         firm_sub = $2
+         or (firm_email is not null and $3::text is not null
+             and lower(firm_email) = lower($3))
+       )
+     limit 1`,
+    [seatId, profile.sub, profile.email],
+  );
+  return rows.length > 0;
 }
 
 export async function claimSeat(
@@ -267,17 +435,12 @@ export async function claimSeat(
   if (seat.status !== "open") {
     throw new Error(`Seat ${seatId} is ${seat.status}, not open`);
   }
-  const projectRows = await sql<Project>(
-    `select id, name, site, owner_sub, owner_name, is_sample, created_at::text
-     from projects where id = $1`,
-    [seat.project_id],
-  );
-  const project = projectRows[0];
-  if (!project) throw new Error("Project not found");
 
-  const canSee = await canViewProject(project, profile.sub);
-  if (!canSee) {
-    throw new Error("You do not have access to this project table");
+  const invited = await hasInviteForFirm(seatId, profile);
+  if (!invited) {
+    throw new Error(
+      "You are not invited to this seat (invite must match your Cursor identity)",
+    );
   }
 
   const rows = await sql<Seat>(
@@ -287,11 +450,7 @@ export async function claimSeat(
          claimed_by_name = $3,
          claimed_at = now()
      where id = $1 and status = 'open'
-     returning id, project_id, role, scope, status,
-               budget_min::float8 as budget_min,
-               budget_max::float8 as budget_max,
-               claimed_by_sub, claimed_by_name,
-               claimed_at::text, created_at::text`,
+     returning ${SEAT_SELECT}`,
     [seatId, profile.sub, profile.name],
   );
   if (!rows[0]) throw new Error(`Seat ${seatId} is not open`);
@@ -301,7 +460,7 @@ export async function claimSeat(
 export async function addDelivery(
   profile: Profile,
   seatId: string,
-  opts: { path?: string; note?: string; credit?: string },
+  opts: { path?: string; note?: string },
 ): Promise<Delivery> {
   const seat = await getSeat(seatId);
   if (seat.status === "open") {
@@ -321,16 +480,33 @@ export async function addDelivery(
   if (!isClaimant && !isOperatorOwner) {
     throw new Error("Only the claiming firm or project operator can deliver");
   }
-  if (!opts.path?.trim() && !opts.note?.trim()) {
+
+  const path = optionalText("Path", opts.path, LIMITS.path);
+  const note = optionalText("Note", opts.note, LIMITS.note);
+  if (!path && !note) {
     throw new Error("Provide a path and/or note for the delivery artifact");
   }
 
+  // Credit only the authenticated claiming firm — never a client-supplied name.
+  const creditSub = seat.claimed_by_sub;
+  if (!creditSub) {
+    throw new Error("Seat has no claiming firm to credit");
+  }
+  const creditProfile = await getProfile(creditSub);
   const credit =
-    opts.credit?.trim() ||
-    seat.claimed_by_name ||
-    (profile.type === "firm" ? profile.name : undefined);
+    creditProfile?.name?.trim() || seat.claimed_by_name?.trim() || null;
   if (!credit) {
-    throw new Error("Could not determine credit firm; pass a credit name");
+    throw new Error("Could not determine credit firm from claiming identity");
+  }
+
+  const deliveryCount = await sql<{ n: string }>(
+    `select count(*)::text as n from deliveries where project_id = $1`,
+    [seat.project_id],
+  );
+  if (Number(deliveryCount[0]?.n ?? 0) >= LIMITS.deliveriesPerProject) {
+    throw new Error(
+      `At most ${LIMITS.deliveriesPerProject} deliveries per project`,
+    );
   }
 
   const id = shortId("dlv");
@@ -338,15 +514,7 @@ export async function addDelivery(
     `insert into deliveries (id, seat_id, project_id, path, note, credit, credit_sub)
      values ($1, $2, $3, $4, $5, $6, $7)
      returning id, seat_id, project_id, path, note, credit, credit_sub, delivered_at::text`,
-    [
-      id,
-      seat.id,
-      seat.project_id,
-      opts.path?.trim() || null,
-      opts.note?.trim() || null,
-      credit,
-      seat.claimed_by_sub ?? (profile.type === "firm" ? profile.sub : null),
-    ],
+    [id, seat.id, seat.project_id, path, note, credit, creditSub],
   );
 
   await sql(
@@ -356,7 +524,7 @@ export async function addDelivery(
          claimed_by_sub = coalesce(claimed_by_sub, $3),
          claimed_at = coalesce(claimed_at, now())
      where id = $1`,
-    [seat.id, credit, seat.claimed_by_sub ?? profile.sub],
+    [seat.id, credit, creditSub],
   );
 
   return rows[0]!;
@@ -381,21 +549,12 @@ async function getOwnedProject(
 
 export async function getSeat(seatId: string): Promise<Seat> {
   const rows = await sql<Seat>(
-    `select id, project_id, role, scope, status,
-            budget_min::float8 as budget_min,
-            budget_max::float8 as budget_max,
-            claimed_by_sub, claimed_by_name,
-            claimed_at::text, created_at::text
-     from seats where id = $1`,
+    `select ${SEAT_SELECT} from seats where id = $1`,
     [seatId],
   );
   const seat = rows[0];
   if (!seat) throw new Error(`Seat not found: ${seatId}`);
-  seat.invites = await sql<SeatInvite>(
-    `select id, seat_id, firm_name, invited_by_sub, invited_by_name, invited_at::text
-     from seat_invites where seat_id = $1 order by invited_at asc`,
-    [seat.id],
-  );
+  seat.invites = await loadInvites(seat.id);
   return seat;
 }
 

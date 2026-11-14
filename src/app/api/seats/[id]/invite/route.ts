@@ -13,15 +13,24 @@ export async function POST(
     auth.headers.set("Cache-Control", "private, no-store");
     return auth;
   }
-  let body: { firm?: string };
+  let body: { email?: string; sub?: string; firm?: string; label?: string };
   try {
-    body = (await request.json()) as { firm?: string };
+    body = (await request.json()) as typeof body;
   } catch {
     return jsonError("Invalid JSON body");
   }
   const { id } = await context.params;
+  // Accept email or Cursor identity sub — never treat free-text "firm" as auth.
+  const firmEmail = body.email?.trim() || undefined;
+  const firmSub = body.sub?.trim() || undefined;
+  const legacy = body.firm?.trim();
+  const looksLikeEmail = legacy?.includes("@");
   try {
-    const seat = await inviteToSeat(auth.profile, id, body.firm ?? "");
+    const seat = await inviteToSeat(auth.profile, id, {
+      firmEmail: firmEmail || (looksLikeEmail ? legacy : undefined),
+      firmSub: firmSub || (!looksLikeEmail && legacy ? legacy : undefined),
+      label: body.label,
+    });
     return jsonOk({ seat });
   } catch (error) {
     return jsonError(error instanceof Error ? error.message : "Failed", 400);
